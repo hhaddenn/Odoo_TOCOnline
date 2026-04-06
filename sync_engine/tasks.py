@@ -239,3 +239,39 @@ def sync_customers(self, company_id: int, dry_run: bool = True, allow_delete: bo
     except Exception as exc:
         log_sync_failure(None, exc)
         raise exc
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_products(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_products import OdooProductsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_products import TOCProductsConnector
+    from state.models import Company
+    from sync_engine.product_sync import ProductSync
+
+    company = Company.objects.get(id=company_id, is_active=True)
+    engine = ProductSync(
+        company=company,
+        odoo_connector=OdooProductsConnector(client=odoo_client_from_env()),
+        toconline_connector=TOCProductsConnector(api_client=client_from_company(company)),
+    )
+    return engine.run(dry_run=dry_run)
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_suppliers(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_suppliers import OdooSuppliersConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_suppliers import TOCSuppliersConnector
+    from state.models import Company
+    from sync_engine.supplier_sync import SupplierSync
+
+    company = Company.objects.get(id=company_id, is_active=True)
+    engine = SupplierSync(
+        company=company,
+        odoo_connector=OdooSuppliersConnector(client=odoo_client_from_env()),
+        toconline_connector=TOCSuppliersConnector(api_client=client_from_company(company)),
+    )
+    return engine.run(dry_run=dry_run)
