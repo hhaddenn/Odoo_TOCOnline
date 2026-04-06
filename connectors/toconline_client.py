@@ -8,12 +8,24 @@ import logging
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api11.toconline.pt"
+
+
+def _normalize_oauth_token_url(url: str | None) -> str | None:
+    """Normaliza URL de token para host OAuth (appXX) quando vier em apiXX."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.hostname and parsed.hostname.startswith("api"):
+        oauth_host = "app" + parsed.hostname[3:]
+        return urlunparse(parsed._replace(netloc=oauth_host))
+    return url
 
 
 class TOConlineError(Exception):
@@ -43,6 +55,7 @@ class TOConlineClient:
         authorization_code: str | None = None,
         refresh_token: str | None = None,
         access_token: str | None = None,
+        access_token_expires_at: float | None = None,
         base_url: str = _DEFAULT_BASE_URL,
         token_url: str | None = None,
         redirect_uri: str | None = None,
@@ -55,23 +68,137 @@ class TOConlineClient:
         self.authorization_code = authorization_code
         self.refresh_token = refresh_token
         self.base_url = base_url.rstrip("/")
-        self.token_url = (token_url or os.getenv("TOCONLINE_TOKEN_URL") or f"{self.base_url}/oauth/token")
+        raw_token_url = token_url or os.getenv("TOCONLINE_TOKEN_URL") or f"{self.base_url}/oauth/token"
+        self.token_url = _normalize_oauth_token_url(raw_token_url) or raw_token_url
         self.redirect_uri = redirect_uri or os.getenv("TOCONLINE_REDIRECT_URI") or ""
         self.timeout = timeout
         self.oauth_scope = oauth_scope or "commercial"
         self._access_token: str | None = access_token or os.getenv("TOCONLINE_TOKEN") or None
+        self._access_token_expires_at: float | None = access_token_expires_at
         self._on_token_refresh = on_token_refresh
         self._http = httpx.Client(timeout=timeout)
 
-    def _oauth_headers(self) -> dict:
-        # TOConline OAuth exige Basic auth (client_id:client_secret em base64)
-        basic_raw = f"{self.client_id}:{self.client_secret}".encode("utf-8")
-        basic = base64.b64encode(basic_raw).decode("ascii")
-        return {
+    def _oauth_headers(self, auth_mode: str = "basic") -> dict:
+        headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "Authorization": f"Basic {basic}",
         }
+        if auth_mode == "basic":
+            # TOConline pode exigir Basic auth (client_id:client_secret em base64)
+            basic_raw = f"{self.client_id}:{self.client_secret}".encode("utf-8")
+            basic = base64.b64encode(basic_raw).decode("ascii")
+            headers["Authorization"] = f"Basic {basic}"
+        return headers
+
+    def _candidate_token_urls(self) -> list[str]:
+        urls: list[str] = []
+        if self.token_url:
+            # Prefere sempre host OAuth appXX para reduzir 400 HTML no apiXX.
+            normalized = _normalize_oauth_token_url(self.token_url)
+            if normalized:
+                urls.append(normalized)
+            urls.append(self.token_url)
+
+            # Compatibilidade: se token_url ainda vier em apiXX, tenta também appXX.
+            parsed = urlparse(self.token_url)
+            if parsed.hostname and parsed.hostname.startswith("api"):
+                oauth_host = "app" + parsed.hostname[3:]
+                swapped = urlunparse(parsed._replace(netloc=oauth_host))
+                urls.append(swapped)
+
+        seen: set[str] = set()
+        unique: list[str] = []
+        for u in urls:
+            if u not in seen:
+                unique.append(u)
+                seen.add(u)
+        return unique
+
+    def _post_token(self, payload: dict) -> httpx.Response:
+        last_error: httpx.HTTPStatusError | None = None
+        last_request_error: httpx.RequestError | None = None
+        token_urls = self._candidate_token_urls()
+        auth_modes = ("basic", "body")
+
+        for token_url in token_urls:
+            for auth_mode in auth_modes:
+                req_payload = dict(payload)
+                if auth_mode == "body":
+                    req_payload["client_id"] = self.client_id
+                    req_payload["client_secret"] = self.client_secret
+
+                try:
+                    resp = self._http.post(
+                        token_url,
+                        data=req_payload,
+                        headers=self._oauth_headers(auth_mode=auth_mode),
+                    )
+                except httpx.RequestError as exc:
+                    logger.warning("TOConline token request error (%s, %s): %s", token_url, auth_mode, exc)
+                    last_request_error = exc
+                    continue
+                if resp.is_success:
+                    if token_url != self.token_url:
+                        logger.info("TOConline OAuth: token_url alternativo funcionou (%s)", token_url)
+                        self.token_url = token_url
+                    return resp
+
+                logger.warning(
+                    "TOConline token error (%s, %s): %s — %s",
+                    token_url,
+                    auth_mode,
+                    resp.status_code,
+                    (resp.text or "")[:300],
+                )
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+
+        if last_error:
+            raise last_error
+        if last_request_error:
+            raise TOConlineError(f"Falha de rede ao obter/renovar token TOConline: {last_request_error}")
+        raise TOConlineError("Falha ao obter/renovar token TOConline")
+
+    def _notify_token_refresh(self) -> None:
+        if not self._on_token_refresh:
+            return
+        try:
+            self._on_token_refresh(
+                access_token=self._access_token,
+                refresh_token=self.refresh_token,
+                token_url=self.token_url,
+                access_token_expires_at=self._access_token_expires_at,
+            )
+        except TypeError:
+            try:
+                # Compatibilidade com callbacks antigos sem expires_at.
+                self._on_token_refresh(
+                    access_token=self._access_token,
+                    refresh_token=self.refresh_token,
+                    token_url=self.token_url,
+                )
+            except TypeError:
+                # Compatibilidade com callbacks antigos sem token_url.
+                self._on_token_refresh(access_token=self._access_token, refresh_token=self.refresh_token)
+
+    def _set_token_metadata(self, tokens: dict[str, Any]) -> None:
+        expires_in = tokens.get("expires_in")
+        try:
+            expires_in_int = int(expires_in) if expires_in is not None else None
+        except (TypeError, ValueError):
+            expires_in_int = None
+
+        if expires_in_int and expires_in_int > 0:
+            self._access_token_expires_at = time.time() + expires_in_int
+        else:
+            self._access_token_expires_at = None
+
+    def _token_expiring_soon(self, skew_seconds: int = 120) -> bool:
+        if not self._access_token or not self._access_token_expires_at:
+            return False
+        return (self._access_token_expires_at - time.time()) <= skew_seconds
 
     # ── OAuth2 ────────────────────────────────────────────────────────────────
 
@@ -85,15 +212,12 @@ class TOConlineClient:
         }
         if self.redirect_uri:
             payload["redirect_uri"] = self.redirect_uri
-        resp = self._http.post(self.token_url, data=payload, headers=self._oauth_headers())
-        if not resp.is_success:
-            logger.error("TOConline token error: %s — %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+        resp = self._post_token(payload)
         tokens = resp.json()
         self._access_token = tokens["access_token"]
         self.refresh_token = tokens.get("refresh_token", self.refresh_token)
-        if self._on_token_refresh:
-            self._on_token_refresh(access_token=self._access_token, refresh_token=self.refresh_token)
+        self._set_token_metadata(tokens)
+        self._notify_token_refresh()
         logger.info("TOConline: token obtido via authorization_code.")
 
     def _refresh_access_token(self) -> None:
@@ -104,15 +228,12 @@ class TOConlineClient:
             "refresh_token": self.refresh_token,
             "scope": self.oauth_scope,
         }
-        resp = self._http.post(self.token_url, data=payload, headers=self._oauth_headers())
-        if not resp.is_success:
-            logger.error("TOConline token error: %s — %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+        resp = self._post_token(payload)
         tokens = resp.json()
         self._access_token = tokens["access_token"]
         self.refresh_token = tokens.get("refresh_token", self.refresh_token)
-        if self._on_token_refresh:
-            self._on_token_refresh(access_token=self._access_token, refresh_token=self.refresh_token)
+        self._set_token_metadata(tokens)
+        self._notify_token_refresh()
         logger.info("TOConline: token renovado via refresh_token.")
 
     def authenticate(self, force_refresh: bool = False) -> None:
@@ -133,7 +254,7 @@ class TOConlineClient:
                 self._fetch_token_with_code()
             return
 
-        if self._access_token:
+        if self._access_token and not self._token_expiring_soon():
             return
 
         if self.refresh_token:
@@ -151,7 +272,7 @@ class TOConlineClient:
 
     @property
     def _headers(self) -> dict:
-        if not self._access_token:
+        if (not self._access_token) or self._token_expiring_soon():
             self.authenticate()
         return {
             "Authorization": f"Bearer {self._access_token}",
@@ -214,7 +335,7 @@ def client_from_env() -> TOConlineClient:
         refresh_token=os.getenv("TOCONLINE_REFRESH_TOKEN") or None,
         access_token=os.getenv("TOCONLINE_TOKEN") or None,
         base_url=base_url,
-        token_url=os.getenv("TOCONLINE_TOKEN_URL") or None,
+        token_url=_normalize_oauth_token_url(os.getenv("TOCONLINE_TOKEN_URL")) or None,
         redirect_uri=os.getenv("TOCONLINE_REDIRECT_URI") or None,
     )
 
@@ -239,18 +360,59 @@ def client_from_company(company, on_token_refresh=None) -> TOConlineClient:
         return client_from_env()
     
     creds = conn.credentials or {}
+    # Evita drift em produção: por omissão, usa sempre os tokens da BD (por cliente).
+    # Override por .env só é aplicado quando:
+    # - faltar credencial na BD, ou
+    # - TOCONLINE_FORCE_ENV_TOKENS=True (modo intervenção/manual).
+    env_access_token = os.getenv("TOCONLINE_TOKEN") or None
+    env_refresh_token = os.getenv("TOCONLINE_REFRESH_TOKEN") or None
+    env_auth_code = os.getenv("TOCONLINE_AUTHORIZATION_CODE") or None
+    force_env_tokens = os.getenv("TOCONLINE_FORCE_ENV_TOKENS", "False") == "True"
+
+    use_env_access = bool(env_access_token and (force_env_tokens or not creds.get("access_token")))
+    use_env_refresh = bool(env_refresh_token and (force_env_tokens or not creds.get("refresh_token")))
+    use_env_auth_code = bool(env_auth_code and (force_env_tokens or not creds.get("authorization_code")))
+
+    # Se o operador optar por override (ou a BD estiver incompleta), sincroniza .env -> BD.
+    creds_changed = False
+    if use_env_access and env_access_token != creds.get("access_token"):
+        creds["access_token"] = env_access_token
+        creds_changed = True
+    if use_env_refresh and env_refresh_token != creds.get("refresh_token"):
+        creds["refresh_token"] = env_refresh_token
+        creds_changed = True
+    if use_env_auth_code and env_auth_code != creds.get("authorization_code"):
+        creds["authorization_code"] = env_auth_code
+        creds_changed = True
+    if creds_changed:
+        conn.credentials = creds
+        conn.save(update_fields=["credentials", "updated_at"])
     base_url = conn.base_url
     oauth_base_url = creds.get("oauth_url") or creds.get("oauth_base_url") or ""
     token_url = creds.get("token_url") or (f"{oauth_base_url.rstrip('/')}/token" if oauth_base_url else None)
+    token_url = _normalize_oauth_token_url(token_url or os.getenv("TOCONLINE_TOKEN_URL") or None)
+    if token_url and token_url != creds.get("token_url"):
+        creds["token_url"] = token_url
+        conn.credentials = creds
+        conn.save(update_fields=["credentials", "updated_at"])
+
+    access_token_expires_at = None
+    raw_expires_at = creds.get("access_token_expires_at")
+    if raw_expires_at is not None:
+        try:
+            access_token_expires_at = float(raw_expires_at)
+        except (TypeError, ValueError):
+            access_token_expires_at = None
     
     return TOConlineClient(
         client_id=creds.get("client_id", os.environ.get("TOCONLINE_CLIENT_ID")),
         client_secret=creds.get("client_secret", os.environ.get("TOCONLINE_CLIENT_SECRET")),
-        authorization_code=creds.get("authorization_code") or os.getenv("TOCONLINE_AUTHORIZATION_CODE") or None,
-        refresh_token=creds.get("refresh_token") or os.getenv("TOCONLINE_REFRESH_TOKEN") or None,
-        access_token=creds.get("access_token") or os.getenv("TOCONLINE_TOKEN") or None,
+        authorization_code=(env_auth_code if use_env_auth_code else creds.get("authorization_code")) or None,
+        refresh_token=(env_refresh_token if use_env_refresh else creds.get("refresh_token")) or None,
+        access_token=(env_access_token if use_env_access else creds.get("access_token")) or None,
+        access_token_expires_at=access_token_expires_at,
         base_url=base_url,
-        token_url=token_url or os.getenv("TOCONLINE_TOKEN_URL") or None,
+        token_url=token_url,
         redirect_uri=os.getenv("TOCONLINE_REDIRECT_URI") or None,
         on_token_refresh=on_token_refresh,
     )

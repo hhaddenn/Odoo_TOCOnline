@@ -14,7 +14,7 @@ class TOCCustomerConnector:
             self.client = api_client
         elif company:
             # Carrega credenciais da BD e passa callback para persistir tokens
-            def on_token_refresh(access_token, refresh_token):
+            def on_token_refresh(access_token, refresh_token, token_url=None, access_token_expires_at=None):
                 """Callback para salvar tokens renovados na BD."""
                 if not company:
                     return
@@ -28,6 +28,10 @@ class TOCCustomerConnector:
                     conn.credentials = conn.credentials or {}
                     conn.credentials["access_token"] = access_token
                     conn.credentials["refresh_token"] = refresh_token
+                    if token_url:
+                        conn.credentials["token_url"] = token_url
+                    if access_token_expires_at is not None:
+                        conn.credentials["access_token_expires_at"] = access_token_expires_at
                     conn.save()
                     logger.info(f"Tokens de {company.name} atualizados na BD")
                 except CompanyConnection.DoesNotExist:

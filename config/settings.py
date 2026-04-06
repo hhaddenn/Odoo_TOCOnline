@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from celery.schedules import crontab
 
 from dotenv import load_dotenv
 
@@ -86,6 +87,13 @@ CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
+
+CELERY_BEAT_SCHEDULE = {
+    "refresh-toconline-tokens-every-30-min": {
+        "task": "sync_engine.tasks.force_refresh_all_toconline_tokens",
+        "schedule": crontab(minute="*/30"),
+    },
+}
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
