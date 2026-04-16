@@ -83,6 +83,19 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      web:
+        condition: service_started
+
   odoo_db:
     image: postgres:15-alpine
     restart: unless-stopped

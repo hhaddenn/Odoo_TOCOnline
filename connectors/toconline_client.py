@@ -6,11 +6,12 @@ from __future__ import annotations
 import base64
 import logging
 import os
-import time
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import httpx
+from sync_engine.metrics import increment_sync_total, timed_operation
+from sync_engine.retry import RetryPolicy, should_retry_http_status, sleep_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class TOConlineClient:
         self.redirect_uri = redirect_uri or os.getenv("TOCONLINE_REDIRECT_URI") or ""
         self.timeout = timeout
         self.oauth_scope = oauth_scope or "commercial"
+        self.retry_policy = RetryPolicy(max_retries=int(os.getenv("TOCONLINE_MAX_RETRIES", "3")))
         self._access_token: str | None = access_token or os.getenv("TOCONLINE_TOKEN") or None
         self._access_token_expires_at: float | None = access_token_expires_at
         self._on_token_refresh = on_token_refresh
@@ -128,16 +130,19 @@ class TOConlineClient:
                     req_payload["client_secret"] = self.client_secret
 
                 try:
-                    resp = self._http.post(
-                        token_url,
-                        data=req_payload,
-                        headers=self._oauth_headers(auth_mode=auth_mode),
-                    )
+                    with timed_operation(entity="external_api", endpoint="toconline:/oauth/token"):
+                        resp = self._http.post(
+                            token_url,
+                            data=req_payload,
+                            headers=self._oauth_headers(auth_mode=auth_mode),
+                            timeout=self.timeout,
+                        )
                 except httpx.RequestError as exc:
                     logger.warning("TOConline token request error (%s, %s): %s", token_url, auth_mode, exc)
                     last_request_error = exc
                     continue
                 if resp.is_success:
+                    increment_sync_total("external_api", "toconline:/oauth/token", "success")
                     if token_url != self.token_url:
                         logger.info("TOConline OAuth: token_url alternativo funcionou (%s)", token_url)
                         self.token_url = token_url
@@ -154,6 +159,7 @@ class TOConlineClient:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as exc:
                     last_error = exc
+                    increment_sync_total("external_api", "toconline:/oauth/token", "error")
 
         if last_error:
             raise last_error
@@ -282,20 +288,27 @@ class TOConlineClient:
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
         url = f"{self.base_url}{path}"
-        for attempt in range(1, 4):
-            resp = self._http.request(method, url, headers=self._headers, **kwargs)
+        endpoint_label = f"toconline:{path}"
+        for attempt in range(1, self.retry_policy.max_retries + 1):
+            with timed_operation(entity="external_api", endpoint=endpoint_label):
+                resp = self._http.request(method, url, headers=self._headers, timeout=self.timeout, **kwargs)
+
             if resp.status_code == 401:
-                # Token expirado — renova e tenta de novo
                 logger.warning("TOConline 401 — a renovar token…")
                 self.authenticate(force_refresh=True)
-                resp = self._http.request(method, url, headers=self._headers, **kwargs)
-            if resp.status_code >= 500:
-                logger.warning("TOConline %s attempt %d/%d", resp.status_code, attempt, 3)
-                if attempt == 3:
+                with timed_operation(entity="external_api", endpoint=endpoint_label):
+                    resp = self._http.request(method, url, headers=self._headers, timeout=self.timeout, **kwargs)
+
+            if should_retry_http_status(resp.status_code):
+                logger.warning("TOConline %s attempt %d/%d", resp.status_code, attempt, self.retry_policy.max_retries)
+                if attempt == self.retry_policy.max_retries:
+                    increment_sync_total("external_api", endpoint_label, "error")
                     resp.raise_for_status()
-                time.sleep(2 ** attempt)
+                sleep_with_backoff(attempt, policy=self.retry_policy)
                 continue
+
             resp.raise_for_status()
+            increment_sync_total("external_api", endpoint_label, "success")
             return resp.json() if resp.content else None
         return None
 

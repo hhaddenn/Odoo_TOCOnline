@@ -40,6 +40,7 @@ class CompanyConnection(models.Model):
     )
     is_active = models.BooleanField(default=True)
     last_tested_at = models.DateTimeField(null=True, blank=True)
+    rotated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -126,3 +127,48 @@ class EntitySnapshot(models.Model):
     class Meta:
         unique_together = [("company", "system", "entity_type")]
         ordering = ["-taken_at"]
+
+
+class IdempotencyKey(models.Model):
+    class Status(models.TextChoices):
+        IN_PROGRESS = "in_progress", "In Progress"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    key = models.CharField(max_length=64, unique=True)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="idempotency_keys")
+    entity_type = models.CharField(max_length=50)
+    operation = models.CharField(max_length=100)
+    payload = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.IN_PROGRESS)
+    attempt_count = models.PositiveIntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "entity_type", "operation"]),
+            models.Index(fields=["status", "updated_at"]),
+        ]
+
+
+class DeadLetterEntry(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="dead_letters")
+    entity_type = models.CharField(max_length=50)
+    operation = models.CharField(max_length=100)
+    endpoint = models.CharField(max_length=255, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField()
+    stack_trace = models.TextField(blank=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    is_reprocessed = models.BooleanField(default=False)
+    reprocessed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "entity_type", "created_at"]),
+            models.Index(fields=["is_reprocessed", "created_at"]),
+        ]

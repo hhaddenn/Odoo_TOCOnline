@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Any
 
 import httpx
+from sync_engine.metrics import increment_sync_total, timed_operation
+from sync_engine.retry import RetryPolicy, should_retry_http_status, sleep_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class OdooClient:
         self.password = password
         self.timeout = timeout
         self.max_retries = max_retries
+        self.retry_policy = RetryPolicy(max_retries=max_retries)
         self._uid: int | None = None
         self._http = httpx.Client(timeout=timeout)
 
@@ -64,19 +66,41 @@ class OdooClient:
             "id": 1,
             "params": params,
         }
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, self.retry_policy.max_retries + 1):
             try:
-                resp = self._http.post(url, json=payload)
+                with timed_operation(entity="external_api", endpoint=f"odoo:{endpoint}"):
+                    resp = self._http.post(url, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
                     raise OdooError(data["error"])
+                increment_sync_total("external_api", f"odoo:{endpoint}", "success")
                 return data.get("result")
-            except (httpx.TransportError, httpx.TimeoutException) as exc:
-                logger.warning("Odoo RPC attempt %d/%d failed: %s", attempt, self.max_retries, exc)
-                if attempt == self.max_retries:
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                retryable = should_retry_http_status(status)
+                logger.warning(
+                    "Odoo RPC attempt %d/%d status=%s retryable=%s",
+                    attempt,
+                    self.retry_policy.max_retries,
+                    status,
+                    retryable,
+                )
+                if (not retryable) or attempt == self.retry_policy.max_retries:
+                    increment_sync_total("external_api", f"odoo:{endpoint}", "error")
                     raise
-                time.sleep(2 ** attempt)
+                sleep_with_backoff(attempt, policy=self.retry_policy)
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                logger.warning(
+                    "Odoo RPC transport attempt %d/%d failed: %s",
+                    attempt,
+                    self.retry_policy.max_retries,
+                    exc,
+                )
+                if attempt == self.retry_policy.max_retries:
+                    increment_sync_total("external_api", f"odoo:{endpoint}", "error")
+                    raise
+                sleep_with_backoff(attempt, policy=self.retry_policy)
         return None  # unreachable
 
     def _jsonrpc(self, service: str, method: str, args: list[Any]) -> Any:

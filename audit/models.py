@@ -51,3 +51,31 @@ class SyncLog(models.Model):
 
     def __str__(self) -> str:
         return f"[{self.status.upper()}] {self.entity_type} @ {self.created_at:%Y-%m-%d %H:%M:%S}"
+
+
+class SyncAlert(models.Model):
+    class AlertType(models.TextChoices):
+        FAILURE_RATE = "failure_rate", "Failure Rate"
+        TOKEN_EXPIRED = "token_expired", "Token Expired"
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="sync_alerts",
+        null=True,
+        blank=True,
+    )
+    alert_type = models.CharField(max_length=30, choices=AlertType.choices)
+    message = models.TextField()
+    context = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["alert_type", "created_at"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.alert_type}] {self.created_at:%Y-%m-%d %H:%M:%S}"

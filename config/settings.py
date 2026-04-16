@@ -93,7 +93,33 @@ CELERY_BEAT_SCHEDULE = {
         "task": "sync_engine.tasks.force_refresh_all_toconline_tokens",
         "schedule": crontab(minute="*/30"),
     },
+    "evaluate-sync-alerts-every-5-min": {
+        "task": "sync_engine.tasks.evaluate_sync_alerts",
+        "schedule": crontab(minute="*/5"),
+    },
+    "purge-old-sync-logs-daily": {
+        "task": "sync_engine.tasks.purge_old_sync_logs",
+        "schedule": crontab(minute=30, hour=3),
+    },
+    "reprocess-dead-letters-every-15-min": {
+        "task": "sync_engine.tasks.reprocess_dead_letters",
+        "schedule": crontab(minute="*/15"),
+    },
 }
+
+SYNC_HTTP_TIMEOUT_SECONDS = int(os.getenv("SYNC_HTTP_TIMEOUT_SECONDS", "30"))
+SYNC_HTTP_MAX_RETRIES = int(os.getenv("SYNC_HTTP_MAX_RETRIES", "3"))
+SYNC_HTTP_BACKOFF_BASE_SECONDS = float(os.getenv("SYNC_HTTP_BACKOFF_BASE_SECONDS", "1.0"))
+SYNC_HTTP_BACKOFF_MAX_SECONDS = float(os.getenv("SYNC_HTTP_BACKOFF_MAX_SECONDS", "30.0"))
+SYNC_HTTP_BACKOFF_JITTER_SECONDS = float(os.getenv("SYNC_HTTP_BACKOFF_JITTER_SECONDS", "0.25"))
+
+SYNC_BREAKER_FAILURE_THRESHOLD = int(os.getenv("SYNC_BREAKER_FAILURE_THRESHOLD", "5"))
+SYNC_BREAKER_COOLDOWN_SECONDS = int(os.getenv("SYNC_BREAKER_COOLDOWN_SECONDS", "60"))
+
+SYNC_ALERT_WINDOW_MINUTES = int(os.getenv("SYNC_ALERT_WINDOW_MINUTES", "15"))
+SYNC_ALERT_FAILURE_RATE_THRESHOLD = float(os.getenv("SYNC_ALERT_FAILURE_RATE_THRESHOLD", "0.20"))
+
+SYNC_LOG_RETENTION_DAYS = int(os.getenv("SYNC_LOG_RETENTION_DAYS", "180"))
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
