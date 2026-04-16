@@ -25,6 +25,7 @@ from sync_engine.mappers.products import (
 class SyncAction(str, Enum):
     CREATE_IN_TOC = "create_in_toc"
     UPDATE_TOC_FROM_ODOO = "update_toc_from_odoo"
+    DELETE_IN_TOC = "delete_in_toc"
     SKIP = "skip"
 
 
@@ -92,6 +93,19 @@ class ProductSync:
             },
         )
 
+    def _delete_entity_link(self, odoo_id: int | None = None, toconline_id: str | int | None = None) -> int:
+        if self.company is None:
+            return 0
+        query = EntityLink.objects.filter(
+            company=self.company,
+            entity_type=EntityLink.EntityType.PRODUCT,
+        )
+        if odoo_id is not None:
+            query = query.filter(odoo_id=odoo_id)
+        if toconline_id is not None:
+            query = query.filter(toconline_id=str(toconline_id))
+        return query.delete()[0]
+
     def _build_decision(
         self,
         odoo_product: dict[str, Any],
@@ -140,7 +154,7 @@ class ProductSync:
             differences=diffs,
         )
 
-    def plan_sync(self, dry_run: bool = True) -> dict[str, Any]:
+    def plan_sync(self, dry_run: bool = True, allow_delete: bool = False) -> dict[str, Any]:
         odoo_products = self.odoo_connector.get_products()
         toc_products = self._extract_toc_products(self.toconline_connector.get_products())
 
@@ -152,7 +166,8 @@ class ProductSync:
                 toc_by_code[code] = toc_product
 
         decisions: list[SyncDecision] = []
-        created = updated = skipped = failed = 0
+        created = updated = deleted = skipped = failed = 0
+        matched_toc_ids: set[str] = set()
 
         for odoo_product in odoo_products:
             try:
@@ -171,6 +186,8 @@ class ProductSync:
                         link = self._find_link_by_odoo_id(int(odoo_product.get("id"))) if odoo_product.get("id") is not None else None
                         if link is not None:
                             toc_product = next((item for item in toc_products if str(item.get("id")) == str(link.toconline_id)), None)
+                    if toc_product is not None and toc_product.get("id") is not None:
+                        matched_toc_ids.add(str(toc_product.get("id")))
                     decision = self._build_decision(odoo_product, toc_product)
 
                 decisions.append(decision)
@@ -183,18 +200,42 @@ class ProductSync:
             except Exception:
                 failed += 1
 
+        for toc_product in toc_products:
+            toc_id = toc_product.get("id")
+            if toc_id is None:
+                continue
+            toc_id_str = str(toc_id)
+            if toc_id_str in matched_toc_ids:
+                continue
+
+            action = SyncAction.DELETE_IN_TOC if allow_delete else SyncAction.SKIP
+            reason = "Only in TOConline: delete by policy" if allow_delete else "Only in TOConline: skip (allow_delete=False)"
+            decisions.append(
+                SyncDecision(
+                    action=action,
+                    reason=reason,
+                    toc_product=toc_product,
+                    toc_id=toc_id_str,
+                )
+            )
+            if action == SyncAction.DELETE_IN_TOC:
+                deleted += 1
+            else:
+                skipped += 1
+
         return {
             "created": created,
             "updated": updated,
+            "deleted": deleted,
             "skipped": skipped,
             "failed": failed,
-            "total": len(odoo_products),
+            "total": len(decisions),
             "decisions": decisions,
         }
 
     def apply_decisions(self, plan: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
         decisions: list[SyncDecision] = plan.get("decisions", [])
-        created = updated = skipped = failed = 0
+        created = updated = deleted = skipped = failed = 0
 
         for decision in decisions:
             try:
@@ -214,6 +255,11 @@ class ProductSync:
                         payload = canonical_to_toconline_product_payload(canonical, toconline_id=decision.toc_id)
                         self.toconline_connector.update_product(decision.toc_id, payload)
                         self._upsert_entity_link(int(decision.odoo_id), decision.toc_id, canonical)
+                elif decision.action == SyncAction.DELETE_IN_TOC:
+                    deleted += 1
+                    if not dry_run and decision.toc_id is not None:
+                        self.toconline_connector.delete_product(decision.toc_id)
+                        self._delete_entity_link(odoo_id=decision.odoo_id, toconline_id=decision.toc_id)
                 else:
                     skipped += 1
             except Exception:
@@ -222,14 +268,15 @@ class ProductSync:
         return {
             "created": created,
             "updated": updated,
+            "deleted": deleted,
             "skipped": skipped,
             "failed": failed,
             "total": len(decisions),
             "dry_run": dry_run,
         }
 
-    def run(self, dry_run: bool = True) -> dict[str, Any]:
-        plan = self.plan_sync()
+    def run(self, dry_run: bool = True, allow_delete: bool = False) -> dict[str, Any]:
+        plan = self.plan_sync(dry_run=dry_run, allow_delete=allow_delete)
         result = self.apply_decisions(plan, dry_run=dry_run)
         result["plan"] = plan
         return result

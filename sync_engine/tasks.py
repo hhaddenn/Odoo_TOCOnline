@@ -1,7 +1,3 @@
-"""
-Tarefas Celery de sync — Fase A stub.
-Expandidas nas fases B/C/D.
-"""
 from __future__ import annotations
 
 import logging
@@ -27,7 +23,6 @@ def _persist_toconline_tokens(conn, access_token, refresh_token, token_url=None,
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def health_check_odoo(self, company_id: int) -> dict:
-    """Verifica conectividade com Odoo para uma empresa."""
     from audit.models import SyncLog
     from connectors.odoo_client import OdooClient
     from state.models import CompanyConnection
@@ -77,7 +72,6 @@ def health_check_odoo(self, company_id: int) -> dict:
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def health_check_toconline(self, company_id: int) -> dict:
-    """Verifica conectividade com TOConline para uma empresa."""
     from audit.models import SyncLog
     from connectors.toconline_client import client_from_company
     from state.models import Company, CompanyConnection
@@ -132,7 +126,6 @@ def health_check_toconline(self, company_id: int) -> dict:
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30)
 def force_refresh_toconline_token(self, company_id: int) -> dict:
-    """Força refresh do token TOConline para uma empresa (hard refresh)."""
     from connectors.toconline_client import client_from_company
     from state.models import Company, CompanyConnection
 
@@ -172,7 +165,6 @@ def force_refresh_toconline_token(self, company_id: int) -> dict:
 
 @shared_task(bind=True, max_retries=0)
 def force_refresh_all_toconline_tokens(self) -> dict:
-    """Força refresh do token TOConline para todas as empresas ativas com ligação ativa."""
     from state.models import CompanyConnection
 
     connections = CompanyConnection.objects.filter(
@@ -242,7 +234,7 @@ def sync_customers(self, company_id: int, dry_run: bool = True, allow_delete: bo
 
 
 @shared_task(bind=True, max_retries=0)
-def sync_products(self, company_id: int, dry_run: bool = True) -> dict:
+def sync_products(self, company_id: int, dry_run: bool = True, allow_delete: bool = False) -> dict:
     from connectors.odoo_client import client_from_env as odoo_client_from_env
     from connectors.odoo_products import OdooProductsConnector
     from connectors.toconline_client import client_from_company
@@ -256,11 +248,11 @@ def sync_products(self, company_id: int, dry_run: bool = True) -> dict:
         odoo_connector=OdooProductsConnector(client=odoo_client_from_env()),
         toconline_connector=TOCProductsConnector(api_client=client_from_company(company)),
     )
-    return engine.run(dry_run=dry_run)
+    return engine.run(dry_run=dry_run, allow_delete=allow_delete)
 
 
 @shared_task(bind=True, max_retries=0)
-def sync_suppliers(self, company_id: int, dry_run: bool = True) -> dict:
+def sync_suppliers(self, company_id: int, dry_run: bool = True, allow_delete: bool = False) -> dict:
     from connectors.odoo_client import client_from_env as odoo_client_from_env
     from connectors.odoo_suppliers import OdooSuppliersConnector
     from connectors.toconline_client import client_from_company
@@ -274,4 +266,220 @@ def sync_suppliers(self, company_id: int, dry_run: bool = True) -> dict:
         odoo_connector=OdooSuppliersConnector(client=odoo_client_from_env()),
         toconline_connector=TOCSuppliersConnector(api_client=client_from_company(company)),
     )
-    return engine.run(dry_run=dry_run)
+    return engine.run(dry_run=dry_run, allow_delete=allow_delete)
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_sales_documents(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_sales_documents import OdooSalesDocumentsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_sales_documents import TOCSalesDocumentsConnector
+    from state.models import Company
+    from sync_engine.mappers import sales_documents
+    from sync_engine.document_sync import DocumentSyncEngine
+
+    company = Company.objects.get(id=company_id, is_active=True)
+
+    engine = DocumentSyncEngine(
+        odoo_connector=OdooSalesDocumentsConnector(client=odoo_client_from_env()),
+        toc_connector=TOCSalesDocumentsConnector(api_client=client_from_company(company)),
+        mapper=sales_documents,
+        logger=logger,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "document_type": "sales_invoice",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        **engine.run(document_type="sales_invoice", dry_run=dry_run),
+    }
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_purchase_documents(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_purchase_documents import OdooPurchaseDocumentsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_purchase_documents import TOCPurchaseDocumentsConnector
+    from state.models import Company
+    from sync_engine.mappers import purchase_documents
+    from sync_engine.document_sync import DocumentSyncEngine
+
+    company = Company.objects.get(id=company_id, is_active=True)
+
+    engine = DocumentSyncEngine(
+        odoo_connector=OdooPurchaseDocumentsConnector(client=odoo_client_from_env()),
+        toc_connector=TOCPurchaseDocumentsConnector(api_client=client_from_company(company)),
+        mapper=purchase_documents,
+        logger=logger,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "document_type": "purchase_invoice",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        **engine.run(document_type="purchase_invoice", dry_run=dry_run),
+    }
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_rectificative_documents(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_rectificative_documents import OdooRectificativeDocumentsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_rectificative_documents import TOCRectificativeDocumentsConnector
+    from state.models import Company
+    from sync_engine.mappers import rectificative_documents
+    from sync_engine.document_sync import DocumentSyncEngine
+
+    company = Company.objects.get(id=company_id, is_active=True)
+
+    engine = DocumentSyncEngine(
+        odoo_connector=OdooRectificativeDocumentsConnector(client=odoo_client_from_env()),
+        toc_connector=TOCRectificativeDocumentsConnector(api_client=client_from_company(company)),
+        mapper=rectificative_documents,
+        logger=logger,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "document_type": "rectificative_document",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        **engine.run(document_type="rectificative_document", dry_run=dry_run),
+    }
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_shipment_documents(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_shipment_documents import OdooShipmentDocumentsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_shipment_documents import TOCShipmentDocumentsConnector
+    from state.models import Company
+    from sync_engine.mappers import shipment_documents
+    from sync_engine.document_sync import DocumentSyncEngine
+
+    company = Company.objects.get(id=company_id, is_active=True)
+
+    engine = DocumentSyncEngine(
+        odoo_connector=OdooShipmentDocumentsConnector(client=odoo_client_from_env()),
+        toc_connector=TOCShipmentDocumentsConnector(client=client_from_company(company)),
+        mapper=shipment_documents,
+        logger=logger,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "document_type": "shipment_document",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        **engine.run(document_type="shipment_document", dry_run=dry_run),
+    }
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_sales_receipts(self, company_id: int, dry_run: bool = True) -> dict:
+    from connectors.odoo_client import client_from_env as odoo_client_from_env
+    from connectors.odoo_sales_receipts import OdooSalesReceiptsConnector
+    from connectors.toconline_client import client_from_company
+    from connectors.toconline_sales_receipts import TOCSalesReceiptsConnector
+    from state.models import Company
+    from sync_engine.mappers import sales_receipts
+    from sync_engine.document_sync import DocumentSyncEngine
+
+    company = Company.objects.get(id=company_id, is_active=True)
+
+    engine = DocumentSyncEngine(
+        odoo_connector=OdooSalesReceiptsConnector(client=odoo_client_from_env()),
+        toc_connector=TOCSalesReceiptsConnector(client=client_from_company(company)),
+        mapper=sales_receipts,
+        logger=logger,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "document_type": "sales_receipt",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        **engine.run(document_type="sales_receipt", dry_run=dry_run),
+    }
+
+
+DOCUMENT_SYNC_TASKS = {
+    "sales_invoice": sync_sales_documents,
+    "purchase_invoice": sync_purchase_documents,
+    "rectificative_document": sync_rectificative_documents,
+    "shipment_document": sync_shipment_documents,
+    "sales_receipt": sync_sales_receipts,
+}
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_documents_by_type(self, company_id: int, document_type: str, dry_run: bool = True) -> dict:
+    from state.models import Company
+
+    if not Company.objects.filter(id=company_id, is_active=True).exists():
+        return {
+            "status": "ERROR",
+            "message": f"Empresa {company_id} não encontrada ou inativa",
+            "company_id": company_id,
+            "document_type": document_type,
+            "dry_run": dry_run,
+        }
+
+    sync_task = DOCUMENT_SYNC_TASKS.get(document_type)
+    if sync_task is None:
+        return {
+            "status": "ERROR",
+            "message": f"Tipo documental inválido: {document_type}",
+            "company_id": company_id,
+            "document_type": document_type,
+            "dry_run": dry_run,
+            "supported_types": sorted(DOCUMENT_SYNC_TASKS.keys()),
+        }
+
+    result = sync_task.run(company_id=company_id, dry_run=dry_run)
+    return {
+        "status": "SUCCESS",
+        "company_id": company_id,
+        "document_type": document_type,
+        "dry_run": dry_run,
+        **result,
+    }
+
+
+@shared_task(bind=True, max_retries=0)
+def sync_all_document_types(self, company_id: int, dry_run: bool = True) -> dict:
+    from state.models import Company
+
+    if not Company.objects.filter(id=company_id, is_active=True).exists():
+        return {
+            "status": "ERROR",
+            "message": f"Empresa {company_id} não encontrada ou inativa",
+            "company_id": company_id,
+            "dry_run": dry_run,
+        }
+
+    per_type = {}
+    totals = {"total": 0, "creates": 0, "updates": 0, "skips": 0}
+
+    for doc_type, sync_task in DOCUMENT_SYNC_TASKS.items():
+        result = sync_task.run(company_id=company_id, dry_run=dry_run)
+        per_type[doc_type] = result
+        summary = result.get("summary", {})
+        totals["total"] += int(summary.get("total", 0) or 0)
+        totals["creates"] += int(summary.get("creates", 0) or 0)
+        totals["updates"] += int(summary.get("updates", 0) or 0)
+        totals["skips"] += int(summary.get("skips", 0) or 0)
+
+    return {
+        "status": "SUCCESS",
+        "company_id": company_id,
+        "dry_run": dry_run,
+        "results_by_type": per_type,
+        "summary": totals,
+    }

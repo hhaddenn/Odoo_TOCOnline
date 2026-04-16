@@ -20,6 +20,7 @@ from sync_engine.mappers.suppliers import canonical_to_toconline_supplier_payloa
 class SyncAction(str, Enum):
   CREATE_IN_TOC = "create_in_toc"
   UPDATE_TOC_FROM_ODOO = "update_toc_from_odoo"
+  DELETE_IN_TOC = "delete_in_toc"
   SKIP = "skip"
 
 
@@ -90,6 +91,19 @@ class SupplierSync:
       },
     )
 
+  def _delete_entity_link(self, odoo_id: int | None = None, toconline_id: str | int | None = None) -> int:
+    if self.company is None:
+      return 0
+    query = EntityLink.objects.filter(
+      company=self.company,
+      entity_type=EntityLink.EntityType.SUPPLIER,
+    )
+    if odoo_id is not None:
+      query = query.filter(odoo_id=odoo_id)
+    if toconline_id is not None:
+      query = query.filter(toconline_id=str(toconline_id))
+    return query.delete()[0]
+
   def _select_toc_supplier(self, canonical_supplier: dict[str, Any], toc_suppliers: list[dict[str, Any]]) -> dict[str, Any] | None:
     vat = str(canonical_supplier.get('vat') or '').strip().lower()
     if vat:
@@ -132,7 +146,7 @@ class SupplierSync:
 
     return SyncDecision(action=SyncAction.UPDATE_TOC_FROM_ODOO, reason='fields differ', odoo_supplier=odoo_supplier, toc_supplier=toc_supplier, odoo_id=odoo_supplier.get('id'), toc_id=str(toc_supplier.get('id')) if toc_supplier.get('id') is not None else None)
 
-  def plan_sync(self, dry_run: bool = True) -> dict[str, Any]:
+  def plan_sync(self, dry_run: bool = True, allow_delete: bool = False) -> dict[str, Any]:
     odoo_suppliers = self.odoo_connector.get_suppliers()
     toc_suppliers = self._extract_toc_suppliers(self.toconline_connector.get_suppliers())
 
@@ -147,7 +161,8 @@ class SupplierSync:
         toc_by_key[key] = toc_supplier
 
     decisions: list[SyncDecision] = []
-    created = updated = skipped = failed = 0
+    created = updated = deleted = skipped = failed = 0
+    matched_toc_ids: set[str] = set()
 
     for odoo_supplier in odoo_suppliers:
       try:
@@ -160,6 +175,8 @@ class SupplierSync:
             toc_supplier = next((item for item in toc_suppliers if str(item.get('id')) == str(link.toconline_id)), None)
         if toc_supplier is None:
           toc_supplier = self._select_toc_supplier(canonical, toc_suppliers)
+        if toc_supplier is not None and toc_supplier.get('id') is not None:
+          matched_toc_ids.add(str(toc_supplier.get('id')))
 
         decision = self._build_decision(odoo_supplier, toc_supplier)
         decisions.append(decision)
@@ -172,19 +189,43 @@ class SupplierSync:
       except Exception:
         failed += 1
 
+    for toc_supplier in toc_suppliers:
+      toc_id = toc_supplier.get('id')
+      if toc_id is None:
+        continue
+      toc_id_str = str(toc_id)
+      if toc_id_str in matched_toc_ids:
+        continue
+
+      action = SyncAction.DELETE_IN_TOC if allow_delete else SyncAction.SKIP
+      reason = 'Only in TOConline: delete by policy' if allow_delete else 'Only in TOConline: skip (allow_delete=False)'
+      decisions.append(
+        SyncDecision(
+          action=action,
+          reason=reason,
+          toc_supplier=toc_supplier,
+          toc_id=toc_id_str,
+        )
+      )
+      if action == SyncAction.DELETE_IN_TOC:
+        deleted += 1
+      else:
+        skipped += 1
+
     return {
       'created': created,
       'updated': updated,
+      'deleted': deleted,
       'skipped': skipped,
       'failed': failed,
-      'total': len(odoo_suppliers),
+      'total': len(decisions),
       'decisions': decisions,
       'dry_run': dry_run,
     }
 
   def apply_decisions(self, plan: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
     decisions: list[SyncDecision] = plan.get('decisions', [])
-    created = updated = skipped = failed = 0
+    created = updated = deleted = skipped = failed = 0
 
     for decision in decisions:
       try:
@@ -204,6 +245,11 @@ class SupplierSync:
             self.toconline_connector.update_supplier(decision.toc_id, payload)
             if decision.odoo_id is not None:
               self._upsert_entity_link(int(decision.odoo_id), decision.toc_id, canonical)
+        elif decision.action == SyncAction.DELETE_IN_TOC:
+          deleted += 1
+          if not dry_run and decision.toc_id is not None:
+            self.toconline_connector.delete_supplier(decision.toc_id)
+            self._delete_entity_link(odoo_id=decision.odoo_id, toconline_id=decision.toc_id)
         else:
           skipped += 1
       except Exception:
@@ -212,19 +258,20 @@ class SupplierSync:
     return {
       'created': created,
       'updated': updated,
+      'deleted': deleted,
       'skipped': skipped,
       'failed': failed,
       'total': len(decisions),
       'dry_run': dry_run,
     }
 
-  def run(self, dry_run: bool = True) -> dict[str, Any]:
-    plan = self.plan_sync(dry_run=dry_run)
+  def run(self, dry_run: bool = True, allow_delete: bool = False) -> dict[str, Any]:
+    plan = self.plan_sync(dry_run=dry_run, allow_delete=allow_delete)
     result = self.apply_decisions(plan, dry_run=dry_run)
     result['plan'] = plan
     return result
 
 
-def run(company: Company | None = None, odoo_connector: OdooSuppliersConnector | None = None, toconline_connector: TOCSuppliersConnector | None = None, dry_run: bool = True) -> dict[str, Any]:
+def run(company: Company | None = None, odoo_connector: OdooSuppliersConnector | None = None, toconline_connector: TOCSuppliersConnector | None = None, dry_run: bool = True, allow_delete: bool = False) -> dict[str, Any]:
   engine = SupplierSync(company=company, odoo_connector=odoo_connector, toconline_connector=toconline_connector)
-  return engine.run(dry_run=dry_run)
+  return engine.run(dry_run=dry_run, allow_delete=allow_delete)
