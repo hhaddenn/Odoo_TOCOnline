@@ -7,8 +7,10 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from django.db import transaction
 from django.utils import timezone
 
+from connectors.odoo_client import client_from_env as odoo_client_from_env
 from connectors.odoo_customers import OdooCustomerConnector
 from connectors.toconline_customer import TOCCustomerConnector
 from state.models import Company, DeletionTombstone, EntityLink, EntitySnapshot
@@ -47,8 +49,8 @@ class CustomerSyncEngine:
 		toconline_connector: TOCCustomerConnector | None = None,
 	) -> None:
 		self.company = company
-		self.odoo_connector = odoo_connector or OdooCustomerConnector()
-		self.toconline_connector = toconline_connector or TOCCustomerConnector()
+		self.odoo_connector = odoo_connector or OdooCustomerConnector(client=odoo_client_from_env())
+		self.toconline_connector = toconline_connector or TOCCustomerConnector(company=company)
 		
 	def _extract_toconline_customers(self, payload: Any) -> list[dict[str, Any]]:
 		# Converte resposta do TOConline para uma lista de clientes.
@@ -150,9 +152,34 @@ class CustomerSyncEngine:
       company=self.company,
       entity_type=EntityLink.EntityType.CUSTOMER,
       toconline_id=str(toconline_id)
-    )
+    ).order_by("-updated_at", "-id")
 		
 		return query.first()
+
+
+	def _cleanup_duplicate_links_by_toconline_id(self) -> int:
+		"""Garante no maximo um EntityLink por toconline_id para customer/empresa."""
+		links = list(
+			EntityLink.objects.filter(
+				company=self.company,
+				entity_type=EntityLink.EntityType.CUSTOMER,
+			)
+			.order_by("toconline_id", "-updated_at", "-id")
+		)
+
+		seen_toc_ids: set[str] = set()
+		to_delete: list[int] = []
+		for link in links:
+			toc_id = str(link.toconline_id)
+			if toc_id in seen_toc_ids:
+				to_delete.append(link.id)
+				continue
+			seen_toc_ids.add(toc_id)
+
+		if not to_delete:
+			return 0
+
+		return EntityLink.objects.filter(id__in=to_delete).delete()[0]
 
 
 	def _find_toc_by_vat(
@@ -269,13 +296,20 @@ class CustomerSyncEngine:
 		TODO de aprendizagem:
 		- Confirmar no Django shell que chamadas repetidas não criam duplicados.
 		"""
-		link, _ = EntityLink.objects.update_or_create(
-			company=self.company,
-			entity_type=EntityLink.EntityType.CUSTOMER,
-			odoo_id=int(odoo_id),
-			defaults={"toconline_id": str(toconline_id)},
-		)
-		return link
+		with transaction.atomic():
+			link, _ = EntityLink.objects.update_or_create(
+				company=self.company,
+				entity_type=EntityLink.EntityType.CUSTOMER,
+				odoo_id=int(odoo_id),
+				defaults={"toconline_id": str(toconline_id)},
+			)
+			# Evita 1 toconline_id apontar para varios odoo_id.
+			EntityLink.objects.filter(
+				company=self.company,
+				entity_type=EntityLink.EntityType.CUSTOMER,
+				toconline_id=str(toconline_id),
+			).exclude(id=link.id).delete()
+			return link
 
 	def _delete_entity_link(self, odoo_id: int | None = None, toconline_id: str | int | None = None) -> int:
 		"""B5: remove link quando delete real acontece."""
@@ -434,6 +468,7 @@ class CustomerSyncEngine:
 		try:
 			self.odoo_connector.connect()
 			self.toconline_connector.connect()
+			self._cleanup_duplicate_links_by_toconline_id()
 		except Exception as exc:
 			summary["errors"].append({"error": f"Falha ao conectar a Odoo ou TOConline: {exc}"})
 			return summary
@@ -448,6 +483,7 @@ class CustomerSyncEngine:
 
 		self._update_delete_tracking(odoo_customers, toconline_customers)
 
+		odoo_by_id = {int(customer["id"]): customer for customer in odoo_customers if customer.get("id") is not None}
 		toc_by_id = {str(customer.get("id")): customer for customer in toconline_customers if customer.get("id")}
 		toc_matched_ids: set[str] = set()
 
@@ -496,6 +532,28 @@ class CustomerSyncEngine:
 				continue
 
 			link = self._find_link_by_toconline_id(str(toc_id)) if toc_id else None
+			if link and link.odoo_id is not None:
+				linked_odoo_customer = odoo_by_id.get(int(link.odoo_id))
+				if linked_odoo_customer:
+					decision = self.decide_pair_action(linked_odoo_customer, toc_customer, allow_delete=allow_delete)
+					summary["decisions"].append(_serialize_decision(decision))
+					_bump_counter(decision.action)
+					toc_matched_ids.add(str(toc_id))
+					continue
+
+				decision = SyncDecision(
+					action=SyncAction.SKIP,
+					reason="Link existente para TOConline aponta para Odoo ausente; ignorado para evitar duplicado",
+					toconline_customer=toc_customer,
+					odoo_id=int(link.odoo_id),
+					toconline_id=str(toc_id),
+					toconline_updated_at=self._parse_toconline_updated_at(toc_customer),
+				)
+				summary["decisions"].append(_serialize_decision(decision))
+				_bump_counter(decision.action)
+				toc_matched_ids.add(str(toc_id))
+				continue
+
 			if link and self._is_confirmed_deleted(DeletionTombstone.System.ODOO, link.odoo_id):
 				decision = SyncDecision(
 					action=SyncAction.SKIP,
@@ -554,6 +612,8 @@ class CustomerSyncEngine:
 			"decisions": list(plan.get("decisions", [])),
 		}
 
+		self._cleanup_duplicate_links_by_toconline_id()
+
 		odoo_customers = self.odoo_connector.get_customers()
 		toc_payload = self.toconline_connector.get_customers()
 		toconline_customers = self._extract_toconline_customers(toc_payload)
@@ -604,6 +664,20 @@ class CustomerSyncEngine:
 					toc_customer = toc_by_id.get(str(toc_id)) if toc_id else None
 					if not toc_customer:
 						raise ValueError(f"Cliente TOConline não encontrado para criação no Odoo (toconline_id={toc_id})")
+
+					# Guardrail: evita duplicar cliente Odoo quando o mesmo TOConline ja esta ligado.
+					existing_link = self._find_link_by_toconline_id(str(toc_id)) if toc_id else None
+					if existing_link and existing_link.odoo_id is not None:
+						result["skipped"] += 1
+						continue
+
+					vat = toc_customer.get("attributes", {}).get("tax_registration_number")
+					existing_odoo = self._find_odoo_by_vat(vat, odoo_customers)
+					if existing_odoo and existing_odoo.get("id") is not None and toc_id:
+						self._upsert_entity_link(int(existing_odoo["id"]), str(toc_id))
+						result["skipped"] += 1
+						continue
+
 					payload = self._toconline_to_odoo_payload(toc_customer)
 					new_odoo_id = self.odoo_connector.create_customer(payload)
 					if toc_id and new_odoo_id:

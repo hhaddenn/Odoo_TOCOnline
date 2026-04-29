@@ -1,5 +1,7 @@
 from enum import Enum
 
+from state.models import EntityLink
+
 
 class SyncDecision(Enum):
     CREATE = "create"
@@ -8,12 +10,14 @@ class SyncDecision(Enum):
 
 
 class DocumentSyncEngine:
-    def __init__(self, odoo_connector, toc_connector, mapper, logger=None):
+    def __init__(self, odoo_connector, toc_connector, mapper, logger=None, company=None):
         self.odoo_connector = odoo_connector
         self.toc_connector = toc_connector
         self.mapper = mapper
         self.logger = logger
+        self.company = company
         self.decisions = []
+        self._entity_cache: dict[tuple[str, str], dict] = {}
 
     def _log_warning(self, message):
         if self.logger:
@@ -34,6 +38,142 @@ class DocumentSyncEngine:
     def _is_state_valid(self, state: str) -> bool:
         valid_states = ["PENDENTE", "ENVIADA", "PREPARADA", "COMPLETA", "LIQUIDADA", "CANCELADA", "VENCIDA"]
         return state in valid_states
+
+    def _find_entity_link(self, entity_type: str, odoo_id: str | int | None):
+        if self.company is None or odoo_id in (None, ""):
+            return None
+
+        return EntityLink.objects.filter(
+            company=self.company,
+            entity_type=entity_type,
+            odoo_id=int(odoo_id),
+        ).order_by("-updated_at", "-id").first()
+
+    def _resolve_counterparty_id(self, document_type: str, canonical_doc: dict) -> str | None:
+        partner_id = canonical_doc.get("partner_id")
+        link = None
+
+        if document_type == "purchase_invoice":
+            link = self._find_entity_link(EntityLink.EntityType.SUPPLIER, partner_id)
+        elif document_type == "sales_invoice":
+            link = self._find_entity_link(EntityLink.EntityType.CUSTOMER, partner_id)
+        elif document_type == "rectificative_document":
+            if canonical_doc.get("document_type") == "purchase_refund":
+                link = self._find_entity_link(EntityLink.EntityType.SUPPLIER, partner_id)
+            else:
+                link = self._find_entity_link(EntityLink.EntityType.CUSTOMER, partner_id)
+
+        return str(link.toconline_id) if link and link.toconline_id else None
+
+    def _get_toc_api_client(self):
+        api_client = getattr(self.toc_connector, "api_client", None)
+        if api_client is not None:
+            return api_client
+        return getattr(self.toc_connector, "client", None)
+
+    def _fetch_toc_entity(self, entity_path: str, entity_id: str | int | None) -> dict | None:
+        if entity_id in (None, ""):
+            return None
+
+        cache_key = (entity_path, str(entity_id))
+        if cache_key in self._entity_cache:
+            return self._entity_cache[cache_key]
+
+        api_client = self._get_toc_api_client()
+        if api_client is None:
+            return None
+
+        try:
+            payload = api_client.get(f"/api/{entity_path}/{entity_id}")
+        except Exception:
+            return None
+
+        if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
+            entity = payload["data"]
+        elif isinstance(payload, dict):
+            entity = payload
+        else:
+            entity = None
+
+        if isinstance(entity, dict):
+            self._entity_cache[cache_key] = entity
+            return entity
+        return None
+
+    def _enrich_payload_context(self, document_type: str, canonical_doc: dict) -> dict:
+        enriched = dict(canonical_doc)
+        counterparty_id = self._resolve_counterparty_id(document_type, canonical_doc)
+
+        company_id = None
+        document_series_id = None
+        api_client = self._get_toc_api_client()
+        if api_client and hasattr(api_client, "get_current_company_id"):
+            company_id = api_client.get_current_company_id()
+        if api_client and hasattr(api_client, "get_default_document_series_id"):
+            document_series_id = api_client.get_default_document_series_id(
+                "FC" if document_type == "purchase_invoice" else "FT" if document_type == "sales_invoice" else ""
+            )
+
+        if document_type == "purchase_invoice":
+            enriched["supplier_id"] = counterparty_id
+            if company_id is not None:
+                enriched["company_id"] = company_id
+            if document_series_id is not None:
+                enriched["document_series_id"] = document_series_id
+            supplier = self._fetch_toc_entity("suppliers", counterparty_id)
+            supplier_attrs = supplier.get("attributes", {}) if isinstance(supplier, dict) else {}
+            enriched["supplier_tax_registration_number"] = supplier_attrs.get("tax_registration_number")
+            enriched["supplier_business_name"] = supplier_attrs.get("business_name")
+            enriched["supplier_address_detail"] = supplier_attrs.get("address_detail") or ""
+            enriched["supplier_postcode"] = supplier_attrs.get("postcode") or ""
+            enriched["supplier_city"] = supplier_attrs.get("city") or ""
+            enriched["supplier_country"] = supplier_attrs.get("country_iso_alpha_2") or "PT"
+        elif document_type == "sales_invoice":
+            enriched["customer_id"] = counterparty_id
+            if document_series_id is not None:
+                enriched["document_series_id"] = document_series_id
+            customer = self._fetch_toc_entity("customers", counterparty_id)
+            customer_attrs = customer.get("attributes", {}) if isinstance(customer, dict) else {}
+            enriched["customer_tax_registration_number"] = customer_attrs.get("tax_registration_number")
+            enriched["customer_business_name"] = customer_attrs.get("business_name")
+            enriched["customer_address_detail"] = customer_attrs.get("address_detail") or ""
+            enriched["customer_postcode"] = customer_attrs.get("postcode") or ""
+            enriched["customer_city"] = customer_attrs.get("city") or ""
+            enriched["customer_country"] = customer_attrs.get("country_iso_alpha_2") or "PT"
+        elif document_type == "rectificative_document":
+            if canonical_doc.get("document_type") == "purchase_refund":
+                enriched["supplier_id"] = counterparty_id
+            else:
+                enriched["customer_id"] = counterparty_id
+
+        return enriched
+
+    def _has_required_payload_fields(self, document_type: str, payload: dict) -> tuple[bool, list[str]]:
+        if document_type == "shipment_document":
+            required_fields = ["number", "date", "partner_id", "location_id", "location_dest_id", "company_id"]
+        elif document_type == "purchase_invoice":
+            required_fields = ["document_type", "date", "currency_iso_code", "lines"]
+        elif document_type == "rectificative_document":
+            required_fields = ["document_type", "date", "currency_iso_code"]
+            if payload.get("document_type") == "ND":
+                required_fields.append("supplier_id")
+            else:
+                required_fields.append("customer_id")
+        elif document_type == "sales_receipt":
+            required_fields = ["date", "partner_id"]
+        else:
+            required_fields = ["document_type", "date", "currency_iso_code", "lines"]
+        missing: list[str] = []
+        for field in required_fields:
+            value = payload.get(field)
+            if value in (None, False, "", [], {}):
+                missing.append(field)
+
+        if document_type == "purchase_invoice" and payload.get("supplier_id") in (None, "") and payload.get("supplier_tax_registration_number") in (None, ""):
+            missing.append("supplier_id|supplier_tax_registration_number")
+        if document_type == "sales_invoice" and payload.get("customer_id") in (None, "") and payload.get("customer_tax_registration_number") in (None, ""):
+            missing.append("customer_id|customer_tax_registration_number")
+        return (len(missing) == 0, missing)
     
     def plan_sync(self, document_type="sales_invoice", dry_run=True):
         self.decisions = []
@@ -95,12 +235,24 @@ class DocumentSyncEngine:
             toc_equivalent = self._find_equivalent(odoo_doc, toc_canonical)
             
             if not toc_equivalent:
+                payload = to_payload(self._enrich_payload_context(document_type, odoo_doc))
+                valid_payload, missing_fields = self._has_required_payload_fields(document_type, payload)
+                if not valid_payload:
+                    self.decisions.append({
+                        "decision": SyncDecision.SKIP,
+                        "odoo_id": odoo_doc["external_id"],
+                        "toc_id": None,
+                        "reason": f"Campos obrigatórios em falta: {', '.join(missing_fields)}",
+                        "document_type": document_type,
+                    })
+                    continue
+
                 self.decisions.append({
                     "decision": SyncDecision.CREATE,
                     "odoo_id": odoo_doc["external_id"],
                     "toc_id": None,
                     "reason": "Novo documento no Odoo",
-                    "payload": to_payload(odoo_doc),
+                    "payload": payload,
                     "document_type": document_type
                 })
             else:
@@ -127,12 +279,25 @@ class DocumentSyncEngine:
                             "log_level": "WARNING"
                         })
                     else:
+                        payload = to_payload(self._enrich_payload_context(document_type, odoo_doc), toc_equivalent["external_id"])
+                        valid_payload, missing_fields = self._has_required_payload_fields(document_type, payload)
+                        if not valid_payload:
+                            self.decisions.append({
+                                "decision": SyncDecision.SKIP,
+                                "odoo_id": odoo_doc["external_id"],
+                                "toc_id": toc_equivalent["external_id"],
+                                "reason": f"Campos obrigatórios em falta: {', '.join(missing_fields)}",
+                                "document_type": document_type,
+                                "log_level": "WARNING"
+                            })
+                            continue
+
                         self.decisions.append({
                             "decision": SyncDecision.UPDATE,
                             "odoo_id": odoo_doc["external_id"],
                             "toc_id": toc_equivalent["external_id"],
                             "reason": f"Diferenças: {', '.join(diff.keys())}",
-                            "payload": to_payload(odoo_doc, toc_equivalent["external_id"]),
+                            "payload": payload,
                             "document_type": document_type,
                             "changes": diff
                         })

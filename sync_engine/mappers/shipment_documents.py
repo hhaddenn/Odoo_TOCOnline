@@ -16,6 +16,20 @@ def _extract_m2o_name(value):
     return str(value)
 
 
+def _first_truthy(*values):
+    for value in values:
+        if value not in (None, False, "", [], {}):
+            return value
+    return None
+
+
+def _fallback_number(prefix, external_id, *values):
+    number = _first_truthy(*values)
+    if number not in (None, False, ""):
+        return str(number)
+    return f"{prefix}-{external_id}"
+
+
 def odoo_shipment_document_to_canonical(odoo_doc: dict) -> dict:
     picking_type = odoo_doc.get('picking_type_id', {})
     picking_type_code = picking_type[1].lower() if isinstance(picking_type, (list, tuple)) else str(picking_type).lower()
@@ -40,11 +54,11 @@ def odoo_shipment_document_to_canonical(odoo_doc: dict) -> dict:
     return {
         'external_id': str(odoo_doc.get('id')),
         'document_type': 'shipment_document',
-        'number': odoo_doc.get('name', ''),
+        'number': _fallback_number('SHIP', odoo_doc.get('id'), odoo_doc.get('name'), odoo_doc.get('origin')),
         'type': shipment_type,
         'state': canonical_state,
         'date': str(odoo_doc.get('scheduled_date', '')),
-        'partner_id': str(_extract_m2o_id(odoo_doc.get('partner_id')) or ''),
+        'partner_id': str(_extract_m2o_id(odoo_doc.get('partner_id')) or '') if _extract_m2o_id(odoo_doc.get('partner_id')) is not None else None,
         'location_id': str(_extract_m2o_id(odoo_doc.get('location_id')) or ''),
         'location_dest_id': str(_extract_m2o_id(odoo_doc.get('location_dest_id')) or ''),
         'company_id': str(_extract_m2o_id(odoo_doc.get('company_id')) or ''),
@@ -71,11 +85,11 @@ def toc_shipment_document_to_canonical(toc_doc: dict) -> dict:
     return {
         'external_id': str(toc_doc.get('id')),
         'document_type': 'shipment_document',
-        'number': toc_doc.get('number', ''),
+        'number': _fallback_number('SHIP', toc_doc.get('id'), toc_doc.get('number'), toc_doc.get('document_number')),
         'type': shipment_type,
         'state': canonical_state,
         'date': str(toc_doc.get('date', '')),
-        'partner_id': str(toc_doc.get('partner_id') or ''),
+        'partner_id': str(toc_doc.get('partner_id') or '') if toc_doc.get('partner_id') not in (None, False, '') else None,
         'location_id': str(toc_doc.get('location_id') or ''),
         'location_dest_id': str(toc_doc.get('location_dest_id') or ''),
         'company_id': str(toc_doc.get('company_id') or ''),

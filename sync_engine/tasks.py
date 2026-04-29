@@ -421,6 +421,7 @@ def sync_sales_documents(self, company_id: int, dry_run: bool = True) -> dict:
             toc_connector=TOCSalesDocumentsConnector(api_client=client_from_company(company)),
             mapper=sales_documents,
             logger=logger,
+            company=company,
         )
         return {
             "status": "SUCCESS",
@@ -456,6 +457,7 @@ def sync_purchase_documents(self, company_id: int, dry_run: bool = True) -> dict
             toc_connector=TOCPurchaseDocumentsConnector(api_client=client_from_company(company)),
             mapper=purchase_documents,
             logger=logger,
+            company=company,
         )
         return {
             "status": "SUCCESS",
@@ -491,6 +493,7 @@ def sync_rectificative_documents(self, company_id: int, dry_run: bool = True) ->
             toc_connector=TOCRectificativeDocumentsConnector(api_client=client_from_company(company)),
             mapper=rectificative_documents,
             logger=logger,
+            company=company,
         )
         return {
             "status": "SUCCESS",
@@ -526,6 +529,7 @@ def sync_shipment_documents(self, company_id: int, dry_run: bool = True) -> dict
             toc_connector=TOCShipmentDocumentsConnector(client=client_from_company(company)),
             mapper=shipment_documents,
             logger=logger,
+            company=company,
         )
         return {
             "status": "SUCCESS",
@@ -561,6 +565,7 @@ def sync_sales_receipts(self, company_id: int, dry_run: bool = True) -> dict:
             toc_connector=TOCSalesReceiptsConnector(client=client_from_company(company)),
             mapper=sales_receipts,
             logger=logger,
+            company=company,
         )
         return {
             "status": "SUCCESS",

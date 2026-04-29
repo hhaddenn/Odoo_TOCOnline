@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import time
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -63,6 +64,7 @@ class TOConlineClient:
         timeout: int = 30,
         oauth_scope: str = "commercial",
         on_token_refresh: callable | None = None,
+        fallback_credentials: dict[str, str | None] | None = None,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
@@ -78,7 +80,42 @@ class TOConlineClient:
         self._access_token: str | None = access_token or os.getenv("TOCONLINE_TOKEN") or None
         self._access_token_expires_at: float | None = access_token_expires_at
         self._on_token_refresh = on_token_refresh
+        self._fallback_credentials = fallback_credentials or {}
+        self._fallback_applied = False
         self._http = httpx.Client(timeout=timeout)
+        self._current_company_id: int | None = None
+        self._default_document_series_ids: dict[str, int] = {}
+
+    def _is_unauthorized_client_error(self, exc: Exception) -> bool:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return False
+        response = exc.response
+        if response is None or response.status_code != 401:
+            return False
+        return "unauthorized_client" in (response.text or "").lower()
+
+    def _apply_fallback_credentials(self) -> bool:
+        if self._fallback_applied or not self._fallback_credentials:
+            return False
+
+        fallback_client_id = self._fallback_credentials.get("client_id")
+        fallback_client_secret = self._fallback_credentials.get("client_secret")
+        if not fallback_client_id or not fallback_client_secret:
+            return False
+
+        self.client_id = fallback_client_id
+        self.client_secret = fallback_client_secret
+        self.refresh_token = self._fallback_credentials.get("refresh_token") or self.refresh_token
+        self.authorization_code = self._fallback_credentials.get("authorization_code") or self.authorization_code
+        self._access_token = self._fallback_credentials.get("access_token") or self._access_token
+        self.token_url = (
+            _normalize_oauth_token_url(self._fallback_credentials.get("token_url"))
+            or self._fallback_credentials.get("token_url")
+            or self.token_url
+        )
+        self._fallback_applied = True
+        logger.warning("TOConline OAuth fallback: a usar credenciais do ambiente apos falha com credenciais da BD")
+        return True
 
     def _oauth_headers(self, auth_mode: str = "basic") -> dict:
         headers = {
@@ -244,17 +281,29 @@ class TOConlineClient:
 
     def authenticate(self, force_refresh: bool = False) -> None:
         """Garante access token; usa refresh apenas quando necessário."""
+
+        def _refresh_or_code() -> None:
+            """Tenta refresh; em unauthorized_client tenta authorization_code se existir."""
+            try:
+                self._refresh_access_token()
+            except httpx.HTTPStatusError as exc:
+                if self._is_unauthorized_client_error(exc) and self._apply_fallback_credentials():
+                    try:
+                        self._refresh_access_token()
+                        return
+                    except httpx.HTTPStatusError:
+                        if self.authorization_code:
+                            self._fetch_token_with_code()
+                            return
+                        raise
+                if self.authorization_code:
+                    self._fetch_token_with_code()
+                else:
+                    raise
+
         if force_refresh:
             if self.refresh_token:
-                try:
-                    self._refresh_access_token()
-                except httpx.HTTPStatusError:
-                    # Quando refresh_token expira/revoga, tenta fluxo de authorization_code
-                    # se estiver disponível para recuperar automaticamente.
-                    if self.authorization_code:
-                        self._fetch_token_with_code()
-                    else:
-                        raise
+                _refresh_or_code()
                 return
             if not self._access_token:
                 self._fetch_token_with_code()
@@ -264,13 +313,7 @@ class TOConlineClient:
             return
 
         if self.refresh_token:
-            try:
-                self._refresh_access_token()
-            except httpx.HTTPStatusError:
-                if self.authorization_code:
-                    self._fetch_token_with_code()
-                else:
-                    raise
+            _refresh_or_code()
         else:
             self._fetch_token_with_code()
 
@@ -291,13 +334,19 @@ class TOConlineClient:
         endpoint_label = f"toconline:{path}"
         for attempt in range(1, self.retry_policy.max_retries + 1):
             with timed_operation(entity="external_api", endpoint=endpoint_label):
-                resp = self._http.request(method, url, headers=self._headers, timeout=self.timeout, **kwargs)
+                headers = dict(self._headers)
+                if "json" in kwargs:
+                    headers.pop("Content-Type", None)
+                resp = self._http.request(method, url, headers=headers, timeout=self.timeout, **kwargs)
 
             if resp.status_code == 401:
                 logger.warning("TOConline 401 — a renovar token…")
                 self.authenticate(force_refresh=True)
                 with timed_operation(entity="external_api", endpoint=endpoint_label):
-                    resp = self._http.request(method, url, headers=self._headers, timeout=self.timeout, **kwargs)
+                    headers = dict(self._headers)
+                    if "json" in kwargs:
+                        headers.pop("Content-Type", None)
+                    resp = self._http.request(method, url, headers=headers, timeout=self.timeout, **kwargs)
 
             if should_retry_http_status(resp.status_code):
                 logger.warning("TOConline %s attempt %d/%d", resp.status_code, attempt, self.retry_policy.max_retries)
@@ -327,6 +376,67 @@ class TOConlineClient:
     def health_check(self) -> dict:
         """GET simples para verificar conectividade."""
         return self.get("/api/taxes")
+
+    def get_current_company_id(self) -> int | None:
+        if self._current_company_id is not None:
+            return self._current_company_id
+
+        data = self.get("/api/current_company")
+        items = data.get("data") if isinstance(data, dict) else None
+        if isinstance(items, list) and items:
+            try:
+                self._current_company_id = int(items[0].get("id"))
+            except (TypeError, ValueError, AttributeError):
+                self._current_company_id = None
+        return self._current_company_id
+
+    def get_default_document_series_id(self, document_type: str) -> int | None:
+        if document_type in self._default_document_series_ids:
+            return self._default_document_series_ids[document_type]
+
+        data = self.get("/api/commercial_document_series")
+        items = data.get("data") if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            return None
+
+        matching: list[dict[str, Any]] = []
+        current_company_id = self.get_current_company_id()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            attributes = item.get("attributes") or {}
+            if attributes.get("document_type") != document_type:
+                continue
+            if current_company_id is not None and attributes.get("company_id") != current_company_id:
+                continue
+            if not attributes.get("active", True):
+                continue
+            matching.append(item)
+
+        if not matching:
+            return None
+
+        def _series_sort_key(item: dict[str, Any]) -> tuple[int, int]:
+            attributes = item.get("attributes") or {}
+            try:
+                prefix_value = int(str(attributes.get("prefix") or 0).strip() or 0)
+            except (TypeError, ValueError):
+                prefix_value = 0
+            try:
+                item_id = int(item.get("id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            return (prefix_value, item_id)
+
+        selected = max(matching, key=_series_sort_key)
+        try:
+            series_id = int(selected.get("id"))
+        except (TypeError, ValueError):
+            series_id = None
+
+        if series_id is not None:
+            self._default_document_series_ids[document_type] = series_id
+        return series_id
 
     def close(self) -> None:
         self._http.close()
@@ -417,6 +527,20 @@ def client_from_company(company, on_token_refresh=None) -> TOConlineClient:
         except (TypeError, ValueError):
             access_token_expires_at = None
     
+    fallback_credentials = None
+    if not force_env_tokens:
+        env_client_id = os.environ.get("TOCONLINE_CLIENT_ID")
+        env_client_secret = os.environ.get("TOCONLINE_CLIENT_SECRET")
+        if env_client_id and env_client_secret:
+            fallback_credentials = {
+                "client_id": env_client_id,
+                "client_secret": env_client_secret,
+                "authorization_code": env_auth_code,
+                "refresh_token": env_refresh_token,
+                "access_token": env_access_token,
+                "token_url": os.getenv("TOCONLINE_TOKEN_URL") or token_url,
+            }
+
     return TOConlineClient(
         client_id=creds.get("client_id", os.environ.get("TOCONLINE_CLIENT_ID")),
         client_secret=creds.get("client_secret", os.environ.get("TOCONLINE_CLIENT_SECRET")),
@@ -428,4 +552,5 @@ def client_from_company(company, on_token_refresh=None) -> TOConlineClient:
         token_url=token_url,
         redirect_uri=os.getenv("TOCONLINE_REDIRECT_URI") or None,
         on_token_refresh=on_token_refresh,
+        fallback_credentials=fallback_credentials,
     )

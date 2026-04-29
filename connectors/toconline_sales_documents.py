@@ -4,7 +4,7 @@ from connectors.toconline_client import client_from_company, client_from_env
 class TOCSalesDocumentsConnector:
     """Lê e escreve faturas de venda no TOConline."""
     
-    ENDPOINT = "/api/commercial_sales_documents"
+    ENDPOINT = "/api/v1/commercial_sales_documents"
     
     def __init__(self, api_client=None, company=None):
         self.api_client = api_client or (client_from_company(company) if company else client_from_env())

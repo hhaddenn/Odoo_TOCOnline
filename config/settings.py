@@ -89,6 +89,40 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 
 CELERY_BEAT_SCHEDULE = {
+    # ── Health Checks ──────────────────────────────────────────────────────────
+    "health-check-toconline-every-5-min": {
+        "task": "sync_engine.tasks.health_check_toconline",
+        "schedule": crontab(minute="*/5"),
+        "kwargs": {"company_id": 1},
+    },
+    # ── Master Data (Customers, Suppliers) ──────────────────────────────────────
+    "sync-customers-every-10-min": {
+        "task": "sync_engine.tasks.sync_customers",
+        "schedule": crontab(minute="*/10"),
+        "kwargs": {"company_id": 1, "dry_run": False, "allow_delete": False},
+    },
+    "sync-suppliers-every-10-min": {
+        "task": "sync_engine.tasks.sync_suppliers",
+        "schedule": crontab(minute="*/10"),
+        "kwargs": {"company_id": 1, "dry_run": False, "allow_delete": False},
+    },
+    # ── Documents (Sales, Purchases, etc) ────────────────────────────────────────
+    "sync-sales-documents-every-15-min": {
+        "task": "sync_engine.tasks.sync_sales_documents",
+        "schedule": crontab(minute="*/15"),
+        "kwargs": {"company_id": 1, "dry_run": False},
+    },
+    "sync-purchase-documents-every-15-min": {
+        "task": "sync_engine.tasks.sync_purchase_documents",
+        "schedule": crontab(minute="*/15"),
+        "kwargs": {"company_id": 1, "dry_run": False},
+    },
+    "sync-all-document-types-every-30-min": {
+        "task": "sync_engine.tasks.sync_all_document_types",
+        "schedule": crontab(minute="*/30"),
+        "kwargs": {"company_id": 1, "dry_run": False},
+    },
+    # ── Maintenance & Alerts ──────────────────────────────────────────────────────
     "refresh-toconline-tokens-every-30-min": {
         "task": "sync_engine.tasks.force_refresh_all_toconline_tokens",
         "schedule": crontab(minute="*/30"),

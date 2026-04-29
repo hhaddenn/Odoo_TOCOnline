@@ -16,6 +16,20 @@ def _extract_m2o_name(value):
     return str(value)
 
 
+def _first_truthy(*values):
+    for value in values:
+        if value not in (None, False, "", [], {}):
+            return value
+    return None
+
+
+def _fallback_number(prefix, external_id, *values):
+    number = _first_truthy(*values)
+    if number not in (None, False, ""):
+        return str(number)
+    return f"{prefix}-{external_id}"
+
+
 def odoo_sales_receipt_to_canonical(odoo_receipt: dict) -> dict:
     state_map = {
         'draft': 'PENDENTE',
@@ -29,7 +43,7 @@ def odoo_sales_receipt_to_canonical(odoo_receipt: dict) -> dict:
     return {
         'external_id': str(odoo_receipt.get('id')),
         'document_type': 'sales_receipt',
-        'number': odoo_receipt.get('name', ''),
+        'number': _fallback_number('RCPT', odoo_receipt.get('id'), odoo_receipt.get('name'), odoo_receipt.get('payment_reference')),
         'date': str(odoo_receipt.get('date', '')),
         'partner_id': str(_extract_m2o_id(odoo_receipt.get('partner_id')) or ''),
         'amount': float(odoo_receipt.get('amount', 0)),
@@ -51,9 +65,9 @@ def toc_sales_receipt_to_canonical(toc_receipt: dict) -> dict:
     return {
         'external_id': str(toc_receipt.get('id')),
         'document_type': 'sales_receipt',
-        'number': toc_receipt.get('number', ''),
+        'number': _fallback_number('RCPT', toc_receipt.get('id'), toc_receipt.get('number'), toc_receipt.get('document_number')),
         'date': str(toc_receipt.get('date', '')),
-        'partner_id': str(toc_receipt.get('partner_id') or ''),
+        'partner_id': str(toc_receipt.get('partner_id') or '') if toc_receipt.get('partner_id') not in (None, False, '') else None,
         'amount': float(toc_receipt.get('amount', 0)),
         'currency': toc_receipt.get('currency', 'EUR'),
         'state': canonical_state,
